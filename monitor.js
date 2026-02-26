@@ -8,6 +8,12 @@ const nodemailer = require('nodemailer');
 const http = require('http');
 const https = require('https');
 
+const estadoAlertasSeguridad = {
+  ultimaAlertaPorClave: new Map(),
+};
+
+let canalAlertasSeguridad = null;
+
 // Lee un valor numérico desde las variables de entorno y devuelve un valor por defecto si no está configurado.
 function obtenerNumeroEnv(nombre, valorPorDefecto) {
   const valor = process.env[nombre];
@@ -91,8 +97,89 @@ function crearTransportadorCorreo() {
   };
 }
 
+function normalizarTipoAmenaza(tipo) {
+  const valor = String(tipo || 'PETICION_SOSPECHOSA').trim().toUpperCase();
+  if (!valor) return 'PETICION_SOSPECHOSA';
+  return valor.replace(/\s+/g, '_');
+}
+
+function obtenerCanalAlertasSeguridad() {
+  if (canalAlertasSeguridad) return canalAlertasSeguridad;
+
+  const { transportadorCorreo, DESDE_SMTP, ALERTA_PARA } = crearTransportadorCorreo();
+  canalAlertasSeguridad = { transportadorCorreo, DESDE_SMTP, ALERTA_PARA };
+  return canalAlertasSeguridad;
+}
+
+async function enviarAlertaSeguridad(evento = {}) {
+  const habilitadas = obtenerBooleanoEnv('ALERTAS_SEGURIDAD_HABILITADAS', true);
+  if (!habilitadas) return { sent: false, reason: 'disabled' };
+
+  const tipo = normalizarTipoAmenaza(evento.tipo);
+  const nivel = String(evento.nivel || 'MEDIO').toUpperCase();
+  const origen = String(evento.origen || 'desconocido');
+  const accion = String(evento.accion || 'alerta');
+  const ip = String(evento.ip || 'desconocida');
+  const uuid = String(evento.uuid || 'global');
+  const apiNombre = String(evento.apiNombre || 'N/A');
+  const ruta = String(evento.ruta || 'N/A');
+  const metodo = String(evento.metodo || 'N/A');
+  const confianza = Number(evento.confianza);
+  const amenazas = Array.isArray(evento.amenazas) ? evento.amenazas : [];
+  const evidencia = String(evento.evidencia || '').slice(0, 500);
+  const emailDestinoEvento = String(evento.emailDestino || '').trim();
+  const timestampIso = evento.ts ? new Date(evento.ts).toISOString() : new Date().toISOString();
+
+  const enfriamientoMs = obtenerNumeroEnv('ENFRIAMIENTO_ALERTA_SEGURIDAD_MS', 120_000);
+  const clave = `${tipo}:${nivel}:${ip}:${uuid}`;
+  const ahora = Date.now();
+  const ultima = estadoAlertasSeguridad.ultimaAlertaPorClave.get(clave) || 0;
+
+  if (ahora - ultima < enfriamientoMs) {
+    return { sent: false, reason: 'cooldown' };
+  }
+
+  estadoAlertasSeguridad.ultimaAlertaPorClave.set(clave, ahora);
+
+  const { transportadorCorreo, DESDE_SMTP, ALERTA_PARA } = obtenerCanalAlertasSeguridad();
+  const destinoCorreo = emailDestinoEvento || ALERTA_PARA;
+
+  if (!transportadorCorreo || !destinoCorreo) {
+    console.warn('[ALERTA SEGURIDAD omitida] SMTP no configurado:', { tipo, ip, uuid });
+    return { sent: false, reason: 'smtp-not-configured' };
+  }
+
+  const asunto = `[API-GW][SECURITY][${nivel}] ${tipo} en ${apiNombre}`;
+  const cuerpo = [
+    'Se detectó un evento de seguridad en API Gateway.',
+    '',
+    `Tipo: ${tipo}`,
+    `Nivel: ${nivel}`,
+    `Origen detección: ${origen}`,
+    `Acción aplicada: ${accion}`,
+    `UUID API: ${uuid}`,
+    `Nombre API: ${apiNombre}`,
+    `IP cliente: ${ip}`,
+    `Método: ${metodo}`,
+    `Ruta: ${ruta}`,
+    `Amenazas: ${amenazas.length ? amenazas.join(', ') : 'N/A'}`,
+    `Confianza: ${Number.isFinite(confianza) ? confianza : 'N/A'}`,
+    `Evidencia: ${evidencia || 'N/A'}`,
+    `Timestamp: ${timestampIso}`,
+  ].join('\n');
+
+  await transportadorCorreo.sendMail({
+    from: DESDE_SMTP,
+    to: destinoCorreo,
+    subject: asunto,
+    text: cuerpo,
+  });
+
+  return { sent: true };
+}
+
 // Crea un monitor individual para una API específica.
-function crearMonitorAPI({ uuid, nombre, url, transportadorCorreo, DESDE_SMTP, ALERTA_PARA }) {
+function crearMonitorAPI({ uuid, nombre, url, transportadorCorreo, DESDE_SMTP, ALERTA_PARA_API }) {
   const INTERVALO_HEALTHCHECK_MS = obtenerNumeroEnv('INTERVALO_HEALTHCHECK_MS', 30_000);
   const TIMEOUT_HEALTHCHECK_MS = obtenerNumeroEnv('TIMEOUT_HEALTHCHECK_MS', 5_000);
   const UMBRAL_LATENCIA_MS = obtenerNumeroEnv('UMBRAL_LATENCIA_MS', 1500);
@@ -121,14 +208,14 @@ function crearMonitorAPI({ uuid, nombre, url, transportadorCorreo, DESDE_SMTP, A
     if (ahora - estadoMonitor.ultimaAlertaTs < ENFRIAMIENTO_ALERTA_MS) return;
     estadoMonitor.ultimaAlertaTs = ahora;
 
-    if (!transportadorCorreo) {
+    if (!transportadorCorreo || !ALERTA_PARA_API) {
       console.warn('[ALERTA omitida] SMTP no configurado:', { asunto });
       return;
     }
 
     await transportadorCorreo.sendMail({
       from: DESDE_SMTP,
-      to: ALERTA_PARA,
+      to: ALERTA_PARA_API,
       subject: asunto,
       text: texto,
     });
@@ -167,7 +254,7 @@ function crearMonitorAPI({ uuid, nombre, url, transportadorCorreo, DESDE_SMTP, A
       const estadoAnterior = estadoMonitor.ultimoEstado;
 
       if (estadoMonitor.fallosConsecutivos >= GOLPES_FALLO) {
-        estadoMonitor.ultimoEstado = 'ABAJO';
+        estadoMonitor.ultimoEstado = 'CAIDO';
       } else if (estadoMonitor.latenciaAltaConsecutiva >= GOLPES_LATENCIA_ALTA) {
         estadoMonitor.ultimoEstado = 'DEGRADADO';
       } else if (estadoMonitor.fallosConsecutivos === 0) {
@@ -179,14 +266,14 @@ function crearMonitorAPI({ uuid, nombre, url, transportadorCorreo, DESDE_SMTP, A
       if (estadoAnterior !== estadoMonitor.ultimoEstado) {
         const detalle = `API: ${nombre} (${uuid})\nURL: ${url}\nEstado: ${estadoAnterior} → ${estadoMonitor.ultimoEstado}\nLatencia: ${latenciaMs}ms\nTs: ${new Date(ahora).toISOString()}`;
 
-        if (estadoMonitor.ultimoEstado === 'ABAJO') {
-          await enviarAlertaCorreo(`[API-GW] ${nombre} ABAJO`, detalle);
+        if (estadoMonitor.ultimoEstado === 'CAIDO') {
+          await enviarAlertaCorreo(`[API-GW] ${nombre} CAIDO`, detalle);
         } else if (estadoMonitor.ultimoEstado === 'DEGRADADO') {
           await enviarAlertaCorreo(`[API-GW] ${nombre} DEGRADADO`, detalle);
         } else if (
           estadoMonitor.ultimoEstado === 'ARRIBA' &&
           ALERTAR_RECUPERACION &&
-          (estadoAnterior === 'ABAJO' || estadoAnterior === 'DEGRADADO')
+          (estadoAnterior === 'CAIDO' || estadoAnterior === 'DEGRADADO')
         ) {
           await enviarAlertaCorreo(`[API-GW] ${nombre} RECUPERADO`, detalle);
         }
@@ -198,11 +285,11 @@ function crearMonitorAPI({ uuid, nombre, url, transportadorCorreo, DESDE_SMTP, A
       estadoMonitor.ultimoError = err?.message || String(err);
 
       const estadoAnterior = estadoMonitor.ultimoEstado;
-      estadoMonitor.ultimoEstado = estadoMonitor.fallosConsecutivos >= GOLPES_FALLO ? 'ABAJO' : 'DEGRADADO';
+      estadoMonitor.ultimoEstado = estadoMonitor.fallosConsecutivos >= GOLPES_FALLO ? 'CAIDO' : 'DEGRADADO';
 
-      if (estadoAnterior !== estadoMonitor.ultimoEstado && estadoMonitor.ultimoEstado === 'ABAJO') {
+      if (estadoAnterior !== estadoMonitor.ultimoEstado && estadoMonitor.ultimoEstado === 'CAIDO') {
         const detalle = `API: ${nombre} (${uuid})\nURL: ${url}\nError: ${estadoMonitor.ultimoError}\nTs: ${new Date(ahora).toISOString()}`;
-        await enviarAlertaCorreo(`[API-GW] ${nombre} ABAJO`, detalle);
+        await enviarAlertaCorreo(`[API-GW] ${nombre} CAIDO`, detalle);
       }
     }
   }
@@ -230,13 +317,14 @@ function iniciarMonitorMultiplesAPIs(app, apisConfig = {}) {
   // Crear monitor para cada API activa
   Object.entries(apisConfig).forEach(([uuid, config]) => {
     if (config.activa) {
+      const alertaParaApi = String(config.email_notificacion || '').trim() || ALERTA_PARA;
       monitores[uuid] = crearMonitorAPI({
         uuid,
         nombre: config.nombre,
         url: config.url,
         transportadorCorreo,
         DESDE_SMTP,
-        ALERTA_PARA,
+        ALERTA_PARA_API: alertaParaApi,
       });
       console.log(`✓ Monitor iniciado: ${config.nombre} (${uuid})`);
     }
@@ -261,7 +349,7 @@ function iniciarMonitorMultiplesAPIs(app, apisConfig = {}) {
       totalAPIs: Object.keys(monitores).length,
       resumen: {
         arriba: 0,
-        abajo: 0,
+        CAIDO: 0,
         degradado: 0,
         desconocido: 0,
       },
@@ -289,4 +377,5 @@ function iniciarMonitorMultiplesAPIs(app, apisConfig = {}) {
 
 module.exports = {
   iniciarMonitorMultiplesAPIs,
+  enviarAlertaSeguridad,
 };
