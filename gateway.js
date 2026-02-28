@@ -8,7 +8,7 @@ try {
 const express = require('express');
 const { createProxyMiddleware } = require('http-proxy-middleware');
 const { iniciarMonitorMultiplesAPIs } = require('./monitor');
-const { fetchApis } = require('./supabase');
+const { fetchApis, iniciarSincronizacionConfiguracion, detenerSincronizacionConfiguracion, obtenerEstadoBloqueoIp } = require('./supabase');
 const { iniciarRequestHistorySync, detenerRequestHistorySync } = require('./request-history');
 
 // Middlewares Redis
@@ -131,9 +131,19 @@ app.get('/gateway/ai/status', (_req, res) => {
     enabled: true,
     mode: 'per-api',
     niveles_ia_soportados: ['NO', 'BAJO', 'ALTO'],
-    model: process.env.AI_MODEL || 'gpt-5-mini',
+    model_default: process.env.AI_MODEL || 'gpt-5-mini',
+    model_source: 'apis.ai_model -> fallback .env AI_MODEL',
     api_key_configured: !!process.env.OPENAI_API_KEY
   });
+});
+
+app.get('/gateway/config/bloqip', async (_req, res) => {
+  try {
+    const estado = await obtenerEstadoBloqueoIp();
+    res.json(estado);
+  } catch (error) {
+    res.status(500).json({ error: 'Error obteniendo estado BLOQIP', message: error.message });
+  }
 });
 
 // Medición end-to-end por UUID (desde entrada al gateway hasta respuesta final)
@@ -260,6 +270,7 @@ async function iniciarServidor() {
 
   // Iniciar monitoreo multi-API (health-check + alertas)
   iniciarMonitorMultiplesAPIs(app, apisDisponibles);
+  iniciarSincronizacionConfiguracion();
   iniciarRequestHistorySync();
 
   app.listen(PUERTO, HOST, () => {
@@ -283,6 +294,7 @@ async function apagarGateway(signal) {
   cerrando = true;
 
   console.log(`\n[SHUTDOWN] Señal recibida: ${signal}. Sincronizando reportes pendientes...`);
+  detenerSincronizacionConfiguracion();
   await detenerRequestHistorySync();
   process.exit(0);
 }

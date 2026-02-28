@@ -4,11 +4,13 @@
 const { metrics, blacklist } = require('./redis');
 const { obtenerIpCliente } = require('./ip-utils');
 const { enviarAlertaSeguridad } = require('./monitor');
+const { isIpBlockingEnabled } = require('./supabase');
 
 // Configuración
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const AI_MODEL = process.env.AI_MODEL || 'gpt-5-mini';
 const AI_TIMEOUT = Number(process.env.AI_TIMEOUT || 5000);
+const AI_DEBUG = String(process.env.AI_DEBUG || 'false').toLowerCase() === 'true';
 const NIVELES_IA_VALIDOS = new Set(['NO', 'BAJO', 'ALTO']);
 
 // Umbrales de riesgo
@@ -57,33 +59,72 @@ function normalizarClasificacion(valor) {
   if (texto === 'riesgo-alto' || texto === 'alto') return RISK_THRESHOLDS.HIGH;
   if (texto === 'riesgo-medio' || texto === 'medio') return RISK_THRESHOLDS.MEDIUM;
   if (texto === 'legitimo' || texto === 'legítimo' || texto === 'bajo') return RISK_THRESHOLDS.LOW;
-  return RISK_THRESHOLDS.MEDIUM;
+  return null;
 }
 
-function normalizarAmenazas(amenazas) {
-  if (!Array.isArray(amenazas)) return [];
-  return amenazas
-    .map((item) => String(item || '').trim())
-    .filter(Boolean)
-    .slice(0, 10);
+function obtenerAmenazaPrincipalDesdeLista(amenazas) {
+  if (!Array.isArray(amenazas) || amenazas.length === 0) return 'NINGUNA';
+
+  const normalizadas = amenazas
+    .map((item) => String(item || '').trim().toUpperCase())
+    .filter(Boolean);
+
+  if (normalizadas.includes('SQL_INJECTION') || normalizadas.includes('SQLI')) return 'SQL_INJECTION';
+  if (normalizadas.includes('XSS')) return 'XSS';
+  if (normalizadas.includes('PATH_TRAVERSAL') || normalizadas.includes('PATH TRAVERSAL')) return 'PATH_TRAVERSAL';
+  if (normalizadas.includes('RCE')) return 'RCE';
+  if (normalizadas.includes('POTENTIAL_SCRAPER') || normalizadas.includes('SCRAPING')) return 'SCRAPING';
+  if (normalizadas.includes('SUSPICIOUS_ADMIN_ACCESS')) return 'SUSPICIOUS_ADMIN_ACCESS';
+  if (normalizadas.includes('ANOMALIA_HEADERS')) return 'ANOMALIA_HEADERS';
+
+  return normalizadas[0] || 'NINGUNA';
 }
 
-function normalizarConfianza(confianza) {
+function normalizarAmenazaTexto(amenaza, fallback = 'NINGUNA') {
+  const respaldo = String(fallback || 'NINGUNA').trim().toUpperCase() || 'NINGUNA';
+
+  if (Array.isArray(amenaza)) {
+    return obtenerAmenazaPrincipalDesdeLista(amenaza);
+  }
+
+  const valor = String(amenaza || '').trim();
+  if (!valor) return respaldo;
+
+  const texto = valor.toUpperCase();
+  if (texto === 'NINGUNA' || texto === 'LEGITIMO' || texto === 'LEGÍTIMO') return 'NINGUNA';
+  if (texto === 'SQLI') return 'SQL_INJECTION';
+  if (texto === 'POTENTIAL_SCRAPER') return 'SCRAPING';
+
+  return texto;
+}
+
+function normalizarConfianza(confianza, fallback = 0.5) {
   const valor = Number(confianza);
-  if (!Number.isFinite(valor)) return 0.5;
+  if (!Number.isFinite(valor)) return fallback;
   return Math.max(0, Math.min(1, valor));
 }
 
-function normalizarResultadoLLM(resultado) {
-  const clasificacion = normalizarClasificacion(resultado?.clasificacion);
-  const amenazasDetectadas = normalizarAmenazas(resultado?.amenazas_detectadas);
-  const confianza = normalizarConfianza(resultado?.confianza);
-  const razon = String(resultado?.razon || 'Clasificación generada por LLM').trim().slice(0, 180);
+function normalizarResultadoLLM(resultado, fallback = {}) {
+  const fallbackClasificacion = CLASIFICACIONES_VALIDAS.has(fallback?.clasificacion)
+    ? fallback.clasificacion
+    : RISK_THRESHOLDS.LOW;
+  const fallbackConfianza = Number.isFinite(Number(fallback?.confianza))
+    ? Number(fallback.confianza)
+    : 0.95;
+
+  const clasificacionNormalizada = normalizarClasificacion(resultado?.clasificacion);
+  const clasificacion = clasificacionNormalizada || fallbackClasificacion;
+  const amenazaDetectada = normalizarAmenazaTexto(
+    resultado?.amenazas_detectadas,
+    fallback?.amenazas_detectadas || 'NINGUNA'
+  );
+  const confianza = normalizarConfianza(resultado?.confianza, fallbackConfianza);
+  const razon = String(resultado?.razon || fallback?.razon || 'Clasificación generada por LLM').trim().slice(0, 180);
 
   if (!CLASIFICACIONES_VALIDAS.has(clasificacion)) {
     return {
-      clasificacion: RISK_THRESHOLDS.MEDIUM,
-      amenazas_detectadas: amenazasDetectadas,
+      clasificacion: fallbackClasificacion,
+      amenazas_detectadas: amenazaDetectada,
       confianza,
       razon,
     };
@@ -91,7 +132,7 @@ function normalizarResultadoLLM(resultado) {
 
   return {
     clasificacion,
-    amenazas_detectadas: amenazasDetectadas,
+    amenazas_detectadas: amenazaDetectada,
     confianza,
     razon,
   };
@@ -102,12 +143,16 @@ function normalizarNivelIA(nivel) {
   return NIVELES_IA_VALIDOS.has(nivelNormalizado) ? nivelNormalizado : 'BAJO';
 }
 
+function normalizarModeloIA(modelo) {
+  const valor = String(modelo || '').trim();
+  return valor || AI_MODEL;
+}
+
 function notificarAlertaSeguridadDesdeClasificacion(req, classification, meta = {}) {
   if (!classification) return;
 
-  const amenazas = Array.isArray(classification.amenazas_detectadas)
-    ? classification.amenazas_detectadas
-    : [];
+  const amenaza = normalizarAmenazaTexto(classification.amenazas_detectadas, 'NINGUNA');
+  const amenazas = amenaza !== 'NINGUNA' ? [amenaza] : [];
 
   const clasificacion = String(classification.clasificacion || '').toLowerCase();
   if (clasificacion !== RISK_THRESHOLDS.HIGH && clasificacion !== RISK_THRESHOLDS.MEDIUM) return;
@@ -118,10 +163,10 @@ function notificarAlertaSeguridadDesdeClasificacion(req, classification, meta = 
   const ip = obtenerIpCliente(req);
 
   let tipo = 'PETICION_SOSPECHOSA';
-  if (amenazas.includes('SQL_INJECTION')) tipo = 'SQL_INJECTION';
-  else if (amenazas.includes('XSS')) tipo = 'XSS';
-  else if (amenazas.includes('POTENTIAL_SCRAPER')) tipo = 'SCRAPING';
-  else if (amenazas.includes('SUSPICIOUS_ADMIN_ACCESS')) tipo = 'ACCESO_ADMIN_SOSPECHOSO';
+  if (amenaza === 'SQL_INJECTION') tipo = 'SQL_INJECTION';
+  else if (amenaza === 'XSS') tipo = 'XSS';
+  else if (amenaza === 'SCRAPING' || amenaza === 'POTENTIAL_SCRAPER') tipo = 'SCRAPING';
+  else if (amenaza === 'SUSPICIOUS_ADMIN_ACCESS') tipo = 'ACCESO_ADMIN_SOSPECHOSO';
 
   const nivel = clasificacion === RISK_THRESHOLDS.HIGH ? 'ALTO' : 'MEDIO';
 
@@ -234,12 +279,13 @@ function quickAnalysis(requestData) {
  * @param {Object} requestData - Datos de la petición
  * @returns {Promise<Object>} Clasificación del LLM
  */
-async function classifyWithLLM(requestData) {
+async function classifyWithLLM(requestData, fallbackResultado = {}) {
   if (!OPENAI_API_KEY) {
     throw new Error('OPENAI_API_KEY no configurada');
   }
 
-  const { url, method, headers, body, ip, queryParams, serviceTierPriority } = requestData;
+  const { url, method, headers, body, ip, queryParams, serviceTierPriority, heuristicContext } = requestData;
+  const model = normalizarModeloIA(requestData.model);
 
   const bodyString = JSON.stringify(body || {});
   const finalBody = bodyString.length > 1000 
@@ -257,33 +303,40 @@ async function classifyWithLLM(requestData) {
         - "riesgo-alto": Ataques claros y probados. Ej: Inyección SQL evidente, XSS con payloads ejecutables, Remote Code Execution (RCE), Path Traversal (../etc/passwd), LFI/RFI.
         - "riesgo-medio": Comportamiento anómalo o herramientas sospechosas. Ej: User-Agents de escáneres (Nmap, Nikto), intentos de scraping, caracteres inusuales en campos comunes, peticiones malformadas.
         - "legitimo": Tráfico normal, sin firmas maliciosas.
+
+        CONFIANZA: Del 0.0 al 1.0, indica qué tan seguro estás de la clasificación. Sé conservador: si dudas entre medio y alto, elige medio.
+
+        amenazas_detectadas: Texto único con la amenaza más probable. Ej: "SQL_INJECTION", "XSS", "PATH_TRAVERSAL", "RCE", "SCRAPING", "SUSPICIOUS_ADMIN_ACCESS", "ANOMALIA_HEADERS". Si no detectas ninguna, responde "NINGUNA".
         
         FORMATO DE RESPUESTA:
         {
           "clasificacion": "riesgo-alto" | "riesgo-medio" | "legitimo",
-          "amenazas_detectadas": ["SQLi", "XSS", "Path Traversal", "Scraping", "RCE", "Anomalia_Headers", "Ninguna"],
+          "amenazas_detectadas": "SQL_INJECTION" | "XSS" | "PATH_TRAVERSAL" | "SCRAPING" | "RCE" | "SUSPICIOUS_ADMIN_ACCESS" | "ANOMALIA_HEADERS" | "NINGUNA",
           "confianza": 0.0-1.0,
           "razon": "Justificación técnica de máximo 20 palabras."
         }`;
 
-  const prompt = `Analiza la siguiente petición:
-
-  {
-    "ip": "${ip}",
-    "metodo": "${method}",
-    "ruta": "${url}",
-    "query_params": ${JSON.stringify(queryParams || {})},
-    "headers": {
-      "user-agent": "${headers?.['user-agent'] || 'N/A'}",
-      "content-type": "${headers?.['content-type'] || 'N/A'}",
-      "host": "${headers?.['host'] || 'N/A'}"
+  const payloadAnalisis = {
+    ip,
+    metodo: method,
+    ruta: url,
+    query_params: queryParams || {},
+    headers: {
+      'user-agent': headers?.['user-agent'] || 'N/A',
+      'content-type': headers?.['content-type'] || 'N/A',
+      host: headers?.['host'] || 'N/A',
     },
-    "body_preview": "${finalBody}"
+    body_preview: finalBody,
+  };
+
+  if (heuristicContext?.heuristica_ejecutada === true) {
+    payloadAnalisis.contexto_heuristico_previo = heuristicContext;
   }
-  `;
+
+  const prompt = `Analiza la siguiente petición:\n\n${JSON.stringify(payloadAnalisis, null, 2)}`;
 
   const basePayload = {
-    model: AI_MODEL,
+    model,
     messages: [
       { role: 'system', content: instrucciones },
       { role: 'user', content: prompt }
@@ -331,8 +384,9 @@ async function classifyWithLLM(requestData) {
               enum: ['riesgo-alto', 'riesgo-medio', 'legitimo'],
             },
             amenazas_detectadas: {
-              type: 'array',
-              items: { type: 'string' },
+              type: 'string',
+              minLength: 1,
+              maxLength: 80,
             },
             confianza: {
               type: 'number',
@@ -367,6 +421,9 @@ async function classifyWithLLM(requestData) {
   if (!response.ok) {
     const error = await response.text();
     const openAIError = new Error(`OpenAI API error: ${response.status} - ${error}`);
+    openAIError.code = 'OPENAI_HTTP_ERROR';
+    openAIError.status = response.status;
+    openAIError.responseBody = String(error || '').slice(0, 4000);
     openAIError.llmLatencyMs = latenciaSolicitudesLLMMs;
     throw openAIError;
   }
@@ -379,6 +436,7 @@ async function classifyWithLLM(requestData) {
 
   if (!content || typeof content !== 'string') {
     const llmContentError = new Error('Respuesta del LLM vacía o inválida');
+    llmContentError.code = 'LLM_EMPTY_CONTENT';
     llmContentError.llmLatencyMs = latenciaSolicitudesLLMMs;
     throw llmContentError;
   }
@@ -390,6 +448,8 @@ async function classifyWithLLM(requestData) {
     const jsonMatch = content.match(/\{[\s\S]*\}/);
     if (!jsonMatch) {
       const llmJsonError = new Error('Respuesta del LLM no contiene JSON válido');
+      llmJsonError.code = 'LLM_INVALID_JSON';
+      llmJsonError.responseBody = String(content || '').slice(0, 4000);
       llmJsonError.llmLatencyMs = latenciaSolicitudesLLMMs;
       throw llmJsonError;
     }
@@ -397,7 +457,8 @@ async function classifyWithLLM(requestData) {
   }
 
   return {
-    ...normalizarResultadoLLM(parsed),
+    ...normalizarResultadoLLM(parsed, fallbackResultado),
+    model,
     llmLatencyMs: latenciaSolicitudesLLMMs,
   };
 }
@@ -410,10 +471,12 @@ async function aiClassifierMiddleware(req, res, next) {
   const startTime = Date.now();
   const ip = obtenerIpCliente(req);
   const uuid = req.params?.uuid || 'global';
+  const bloqueoIpActivo = await isIpBlockingEnabled();
   const nivelIAApi = normalizarNivelIA(req.apiConfig?.nivel_ia);
   const nivelIAEfectivo = nivelIAApi;
+  const modeloIAEfectivo = normalizarModeloIA(req.apiConfig?.ai_model);
   const heuristicaActivada = req.apiConfig?.heuristica_activada !== false;
-  const permiteBloqueo = nivelIAEfectivo === 'ALTO';
+  const permiteBloqueo = nivelIAEfectivo === 'ALTO' && bloqueoIpActivo;
 
   // Preparar datos de la petición
   const requestData = {
@@ -421,6 +484,7 @@ async function aiClassifierMiddleware(req, res, next) {
     method: req.method,
     url: req.originalUrl || req.url,
     queryParams: req.query,
+    model: modeloIAEfectivo,
     serviceTierPriority: req.apiConfig?.service_tier_priority === true,
     headers: {
       'user-agent': req.headers['user-agent'],
@@ -433,31 +497,57 @@ async function aiClassifierMiddleware(req, res, next) {
 
   let classification = {
     clasificacion: RISK_THRESHOLDS.LOW,
-    amenazas_detectadas: [],
+    amenazas_detectadas: 'NINGUNA',
     confianza: 1.0,
     razon: 'Sin análisis',
     metodo: 'none',
     nivel_ia: nivelIAEfectivo,
+    ai_model: modeloIAEfectivo,
     heuristica_activada: heuristicaActivada,
     llmLatencyMs: 0,
     heuristicLatencyMs: 0,
     paso_por_llm: false,
+  };
+  let heuristicContext = {
+    heuristica_ejecutada: false,
+    clasificacion_heuristica: 'N/A',
+    amenazas_heuristica: 'NINGUNA',
+    puntaje_heuristica: 0,
+    razon_heuristica: 'Heurística no ejecutada',
   };
 
   try {
     // Paso 1: Análisis heurístico (solo si está activado por API)
     let quickResult = null;
     if (heuristicaActivada) {
-      const inicioHeuristica = Date.now();
+      const inicioHeuristicaTs = Date.now();
+      const inicioHeuristica = performance.now();
       quickResult = quickAnalysis(requestData);
-      const latenciaHeuristicaMs = Date.now() - inicioHeuristica;
+      const finHeuristica = performance.now();
+      const finHeuristicaTs = Date.now();
+      const latenciaHeuristicaMs = Number((finHeuristica - inicioHeuristica).toFixed(3));
       classification.heuristicLatencyMs = latenciaHeuristicaMs;
+
+      if (AI_DEBUG) {
+        console.log('[AI-CLASSIFIER][DEBUG] Timing heurística:', {
+          uuid,
+          metodo: req.method,
+          ruta: req.originalUrl || req.url,
+          inicio_ts: inicioHeuristicaTs,
+          fin_ts: finHeuristicaTs,
+          duracion_ms: latenciaHeuristicaMs,
+          skipped: quickResult?.skipped === true,
+          amenazas: Array.isArray(quickResult?.threats) ? quickResult.threats : [],
+          riskScore: typeof quickResult?.riskScore === 'number' ? quickResult.riskScore : null,
+        });
+      }
 
       if (quickResult.skipped) {
         req.aiClassification = {
           ...classification,
           metodo: 'static-skip',
           razon: 'Recurso estático, análisis omitido',
+          ai_model: modeloIAEfectivo,
           timestamp: new Date().toISOString(),
           latencyMs: Date.now() - startTime,
           llmLatencyMs: 0,
@@ -470,7 +560,7 @@ async function aiClassifierMiddleware(req, res, next) {
       classification = {
         ...classification,
         clasificacion: quickResult.quickClassification,
-        amenazas_detectadas: quickResult.threats,
+        amenazas_detectadas: obtenerAmenazaPrincipalDesdeLista(quickResult.threats),
         confianza: quickResult.quickClassification === RISK_THRESHOLDS.LOW ? 0.95 : 0.85,
         razon: quickResult.quickClassification === RISK_THRESHOLDS.LOW
           ? 'Sin indicadores de amenaza por heurística'
@@ -479,38 +569,68 @@ async function aiClassifierMiddleware(req, res, next) {
         heuristicLatencyMs: latenciaHeuristicaMs,
       };
 
+      heuristicContext = {
+        heuristica_ejecutada: true,
+        clasificacion_heuristica: classification.clasificacion,
+        amenazas_heuristica: classification.amenazas_detectadas,
+        puntaje_heuristica: quickResult.riskScore,
+        razon_heuristica: classification.razon,
+      };
+
       if (classification.clasificacion === RISK_THRESHOLDS.HIGH) {
         notificarAlertaSeguridadDesdeClasificacion(req, classification, {
           origen: 'heuristica',
-          accion: 'bloqueada',
+          accion: bloqueoIpActivo ? 'bloqueada' : 'simulada-no-bloqueada',
         });
 
-        const ttl = Number(process.env.BLACKLIST_TTL_AI || 3600);
-        try {
-          await blacklist.add(ip, ttl);
-          await metrics.incr(`ai:bloqueos-heuristica:${uuid}`);
-        } catch (blacklistError) {
-          console.error('[AI-CLASSIFIER] Error al bloquear IP por heurística:', blacklistError.message);
+        if (!bloqueoIpActivo) {
+          try {
+            await metrics.incr(`ai:bloqueos-heuristica-omitidos:${uuid}`);
+          } catch (_e) {
+            // Ignorar error de métricas
+          }
+
+          res.setHeader('X-Security-Risk', 'high');
+          res.setHeader('X-Security-Threats', classification.amenazas_detectadas || 'NINGUNA');
+          res.setHeader('X-Security-Block-Mode', 'disabled-by-BLOQIP');
+          classification.metodo = 'heuristic-high-no-block';
+          classification.razon = `${classification.razon} | BLOQIP=0, bloqueo omitido`;
+        } else {
+          const ttl = Number(process.env.BLACKLIST_TTL_AI || 3600);
+          try {
+            await blacklist.add(ip, ttl);
+            await metrics.incr(`ai:bloqueos-heuristica:${uuid}`);
+          } catch (blacklistError) {
+            console.error('[AI-CLASSIFIER] Error al bloquear IP por heurística:', blacklistError.message);
+          }
+
+          return res.status(403).json({
+            error: 'Petición bloqueada por sistema de seguridad heurístico',
+            clasificacion: classification.clasificacion,
+            amenazas: classification.amenazas_detectadas,
+            confianza: classification.confianza,
+            ip,
+            ttl_bloqueo: ttl,
+            mensaje: 'Su IP ha sido bloqueada temporalmente por heurística. Contacte al administrador si cree que es un error.'
+          });
         }
-
-        return res.status(403).json({
-          error: 'Petición bloqueada por sistema de seguridad heurístico',
-          clasificacion: classification.clasificacion,
-          amenazas: classification.amenazas_detectadas,
-          confianza: classification.confianza,
-          ip,
-          ttl_bloqueo: ttl,
-          mensaje: 'Su IP ha sido bloqueada temporalmente por heurística. Contacte al administrador si cree que es un error.'
-        });
       }
     } else {
       classification = {
         ...classification,
         clasificacion: RISK_THRESHOLDS.LOW,
-        amenazas_detectadas: [],
+        amenazas_detectadas: 'NINGUNA',
         confianza: 0.0,
         razon: 'Heurística desactivada para esta API',
         metodo: 'heuristic-disabled',
+      };
+
+      heuristicContext = {
+        heuristica_ejecutada: false,
+        clasificacion_heuristica: 'NO_APLICA',
+        amenazas_heuristica: 'NINGUNA',
+        puntaje_heuristica: 0,
+        razon_heuristica: 'Heurística desactivada para esta API',
       };
     }
 
@@ -518,7 +638,7 @@ async function aiClassifierMiddleware(req, res, next) {
     if (nivelIAEfectivo === 'NO') {
       if (classification.clasificacion === RISK_THRESHOLDS.MEDIUM) {
         res.setHeader('X-Security-Risk', 'medium');
-        res.setHeader('X-Security-Threats', classification.amenazas_detectadas.join(','));
+        res.setHeader('X-Security-Threats', classification.amenazas_detectadas || 'NINGUNA');
         res.setHeader('X-Security-IA-Level', nivelIAEfectivo);
       }
 
@@ -526,6 +646,7 @@ async function aiClassifierMiddleware(req, res, next) {
         ...classification,
         metodo: `${classification.metodo}-solo-heuristica`,
         razon: `${classification.razon} (nivel_ia=NO)`,
+        ai_model: modeloIAEfectivo,
         timestamp: new Date().toISOString(),
         latencyMs: Date.now() - startTime,
         llmLatencyMs: 0,
@@ -538,21 +659,54 @@ async function aiClassifierMiddleware(req, res, next) {
     // Paso 3: nivel_ia BAJO/ALTO => llamar IA (sin depender de heurística)
     if (OPENAI_API_KEY) {
       try {
-        const llmResult = await classifyWithLLM(requestData);
+        const llmResult = await classifyWithLLM({
+          ...requestData,
+          heuristicContext,
+        }, {
+          clasificacion: classification.clasificacion,
+          confianza: classification.confianza,
+          razon: classification.razon,
+        });
         classification = {
           ...classification,
           ...llmResult,
           metodo: 'llm',
+          ai_model: llmResult.model || modeloIAEfectivo,
           llmLatencyMs: typeof llmResult.llmLatencyMs === 'number' ? llmResult.llmLatencyMs : 0,
           paso_por_llm: true,
         };
       } catch (llmError) {
-        console.error('[AI-CLASSIFIER] Error LLM:', llmError.message);
+        const llmErrorLog = {
+          mensaje: llmError.message,
+          code: llmError.code || null,
+          status: llmError.status || null,
+          llmLatencyMs: typeof llmError.llmLatencyMs === 'number' ? llmError.llmLatencyMs : null,
+          timeoutMs: AI_TIMEOUT,
+          model: modeloIAEfectivo,
+          uuid,
+          nivel_ia: nivelIAEfectivo,
+          metodo: req.method,
+          ruta: req.originalUrl || req.url,
+          ip,
+          hasApiKey: Boolean(OPENAI_API_KEY),
+        };
+
+        console.error('[AI-CLASSIFIER] Error LLM (fallback activado):', llmErrorLog);
+
+        if (llmError.responseBody) {
+          console.error('[AI-CLASSIFIER] LLM error body:', String(llmError.responseBody).slice(0, 1200));
+        }
+
+        if (AI_DEBUG) {
+          console.error('[AI-CLASSIFIER][DEBUG] Stack LLM:', llmError.stack);
+        }
+
         classification = {
           ...classification,
           confianza: Math.max(classification.confianza || 0, 0.6),
           razon: `${classification.razon} | Fallback por error LLM`,
           metodo: `${classification.metodo}-fallback-llm`,
+          ai_model: modeloIAEfectivo,
           llmLatencyMs: typeof llmError.llmLatencyMs === 'number' ? llmError.llmLatencyMs : 0,
           paso_por_llm: true,
         };
@@ -562,6 +716,7 @@ async function aiClassifierMiddleware(req, res, next) {
         ...classification,
         razon: `${classification.razon} | OPENAI_API_KEY no configurada`,
         metodo: `${classification.metodo}-sin-llm`,
+        ai_model: modeloIAEfectivo,
       };
     }
 
@@ -572,6 +727,7 @@ async function aiClassifierMiddleware(req, res, next) {
     // En caso de error, permitir pasar (fail-open para no bloquear tráfico legítimo)
     req.aiClassification = {
       ...classification,
+      ai_model: modeloIAEfectivo,
       timestamp: new Date().toISOString(),
       latencyMs: Date.now() - startTime,
       llmLatencyMs: 0,
@@ -588,10 +744,9 @@ async function aiClassifierMiddleware(req, res, next) {
     await metrics.incr(`ai:clasificaciones:${classification.clasificacion}`);
     await metrics.incr(`ai:metodo:${classification.metodo}`);
     await metrics.incr(`ai:nivel:${nivelIAEfectivo}`);
-    if (classification.amenazas_detectadas?.length > 0) {
-      for (const threat of classification.amenazas_detectadas) {
-        await metrics.incr(`ai:amenaza:${threat}`);
-      }
+    const amenazaPrincipal = normalizarAmenazaTexto(classification.amenazas_detectadas, 'NINGUNA');
+    if (amenazaPrincipal !== 'NINGUNA') {
+      await metrics.incr(`ai:amenaza:${amenazaPrincipal}`);
     }
   } catch (metricsError) {
     console.error('[AI-CLASSIFIER] Error registrando métricas:', metricsError.message);
@@ -627,18 +782,33 @@ async function aiClassifierMiddleware(req, res, next) {
     });
   }
 
-  if (
-    classification.clasificacion === RISK_THRESHOLDS.MEDIUM
-    || (classification.clasificacion === RISK_THRESHOLDS.HIGH && !permiteBloqueo)
-  ) {
+  if (classification.clasificacion === RISK_THRESHOLDS.HIGH && !permiteBloqueo) {
     notificarAlertaSeguridadDesdeClasificacion(req, classification, {
       origen: classification.metodo || 'llm',
-      accion: classification.clasificacion === RISK_THRESHOLDS.HIGH ? 'warning-alto-sin-bloqueo' : 'warning',
+      accion: 'simulada-no-bloqueada',
+    });
+
+    try {
+      await metrics.incr(`ai:bloqueos-omitidos:${uuid}`);
+    } catch (_e) {
+      // Ignorar error de métricas
+    }
+
+    res.setHeader('X-Security-Risk', 'high');
+    res.setHeader('X-Security-Threats', classification.amenazas_detectadas || 'NINGUNA');
+    res.setHeader('X-Security-IA-Level', nivelIAEfectivo);
+    res.setHeader('X-Security-Block-Mode', 'disabled-by-BLOQIP');
+  }
+
+  if (classification.clasificacion === RISK_THRESHOLDS.MEDIUM) {
+    notificarAlertaSeguridadDesdeClasificacion(req, classification, {
+      origen: classification.metodo || 'llm',
+      accion: 'warning',
     });
 
     // Permitir pero añadir headers de advertencia
     res.setHeader('X-Security-Risk', classification.clasificacion === RISK_THRESHOLDS.HIGH ? 'high' : 'medium');
-    res.setHeader('X-Security-Threats', classification.amenazas_detectadas.join(','));
+    res.setHeader('X-Security-Threats', classification.amenazas_detectadas || 'NINGUNA');
     res.setHeader('X-Security-IA-Level', nivelIAEfectivo);
     try {
       await metrics.incr(`ai:advertencias:${uuid}`);
@@ -651,6 +821,7 @@ async function aiClassifierMiddleware(req, res, next) {
   req.aiClassification = {
     ...classification,
     nivel_ia: nivelIAEfectivo,
+    ai_model: classification.ai_model || modeloIAEfectivo,
     latencyMs,
     llmLatencyMs: typeof classification.llmLatencyMs === 'number' ? classification.llmLatencyMs : 0,
     heuristicLatencyMs: typeof classification.heuristicLatencyMs === 'number' ? classification.heuristicLatencyMs : 0,
@@ -684,7 +855,8 @@ async function getAIMetrics() {
         ai_enabled_global: true,
         modo: 'por-api',
         niveles_soportados: ['NO', 'BAJO', 'ALTO'],
-        model: AI_MODEL,
+        model_default: AI_MODEL,
+        model_source: 'apis.ai_model -> fallback .env AI_MODEL',
         timeout_ms: AI_TIMEOUT
       }
     };
@@ -698,7 +870,8 @@ async function getAIMetrics() {
         ai_enabled_global: true,
         modo: 'por-api',
         niveles_soportados: ['NO', 'BAJO', 'ALTO'],
-        model: AI_MODEL,
+        model_default: AI_MODEL,
+        model_source: 'apis.ai_model -> fallback .env AI_MODEL',
         timeout_ms: AI_TIMEOUT
       }
     };

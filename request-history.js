@@ -22,6 +22,25 @@ let totalErroresSincronizacion = 0;
 let ultimaSincronizacion = null;
 let ultimoErrorSincronizacion = null;
 
+function normalizarAmenazaPersistida(valor) {
+  if (Array.isArray(valor)) {
+    const primera = String(valor[0] || '').trim();
+    return primera || 'NINGUNA';
+  }
+
+  const texto = String(valor || '').trim();
+  if (!texto || texto === '[]' || texto === '{}' || texto.toLowerCase() === 'null') {
+    return 'NINGUNA';
+  }
+
+  return texto;
+}
+
+function normalizarLatenciaPromediable(valor) {
+  if (typeof valor !== 'number' || !Number.isFinite(valor)) return null;
+  return valor > 0 ? valor : null;
+}
+
 function encolarRequestLog(log) {
   const registroPeticion = {
     id_peticion: randomUUID(),
@@ -34,13 +53,14 @@ function encolarRequestLog(log) {
     ip_cliente: log.ip_cliente || null,
     agente_usuario: log.agente_usuario || null,
     clasificacion_ia: log.clasificacion_ia || null,
-    amenazas_ia: Array.isArray(log.amenazas_ia) ? log.amenazas_ia : [],
+    amenazas_ia: normalizarAmenazaPersistida(log.amenazas_ia),
     confianza_ia: typeof log.confianza_ia === 'number' ? log.confianza_ia : null,
+    razon_ia: log.razon_ia || null,
     nivel_ia: log.nivel_ia || null,
     heuristica_activada: log.heuristica_activada === true,
     metodo_ia: log.metodo_ia || null,
     paso_por_llm: Boolean(log.paso_por_llm),
-    latencia_ia_ms: typeof log.latencia_ia_ms === 'number' ? log.latencia_ia_ms : 0,
+    latencia_ia_ms: normalizarLatenciaPromediable(log.latencia_ia_ms),
     latencia_heuristica_ms: typeof log.latencia_heuristica_ms === 'number' ? log.latencia_heuristica_ms : 0,
   };
 

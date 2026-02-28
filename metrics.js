@@ -3,6 +3,25 @@ const { metrics } = require('./redis');
 const { encolarRequestLog } = require('./request-history');
 const { obtenerIpCliente } = require('./ip-utils');
 
+function normalizarLatenciaPromediable(valor) {
+  if (typeof valor !== 'number' || !Number.isFinite(valor)) return null;
+  return valor > 0 ? valor : null;
+}
+
+function normalizarAmenazaParaPersistencia(valor) {
+  if (Array.isArray(valor)) {
+    const primera = String(valor[0] || '').trim();
+    return primera || 'NINGUNA';
+  }
+
+  const texto = String(valor || '').trim();
+  if (!texto || texto === '[]' || texto === '{}' || texto.toLowerCase() === 'null') {
+    return 'NINGUNA';
+  }
+
+  return texto;
+}
+
 async function metricsMiddleware(req, res, next) {
   const start = Date.now();
   const fechaPeticion = new Date(start).toISOString();
@@ -25,13 +44,14 @@ async function metricsMiddleware(req, res, next) {
       ip_cliente: obtenerIpCliente(req),
       agente_usuario: req.headers['user-agent'] || null,
       clasificacion_ia: ai.clasificacion || null,
-      amenazas_ia: ai.amenazas_detectadas || [],
+      amenazas_ia: normalizarAmenazaParaPersistencia(ai.amenazas_detectadas),
       confianza_ia: typeof ai.confianza === 'number' ? ai.confianza : null,
+      razon_ia: ai.razon || null,
       nivel_ia: ai.nivel_ia || null,
       heuristica_activada: ai.heuristica_activada === true,
       metodo_ia: ai.metodo || null,
       paso_por_llm: ai.paso_por_llm === true,
-      latencia_ia_ms: typeof ai.llmLatencyMs === 'number' ? ai.llmLatencyMs : 0,
+      latencia_ia_ms: normalizarLatenciaPromediable(ai.llmLatencyMs),
       latencia_heuristica_ms: typeof ai.heuristicLatencyMs === 'number' ? ai.heuristicLatencyMs : 0,
     });
   });
